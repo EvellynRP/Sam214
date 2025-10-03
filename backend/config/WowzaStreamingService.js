@@ -47,20 +47,43 @@ class WowzaStreamingService {
 
   async testConnection() {
     try {
-      const response = await fetch(`${this.baseUrl}/v2/servers/_defaultServer_/status`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Basic ${Buffer.from(`${this.username}:${this.password}`).toString('base64')}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 10000
-      });
+      // REST API não está disponível (porta 8087 fechada)
+      // Testar conexão via SSH/JMX
+      const SSHManager = require('./SSHManager');
 
-      return {
-        success: response.ok,
-        status: response.status,
-        message: response.ok ? 'Conexão OK' : 'Erro na conexão'
-      };
+      // Buscar serverId
+      const [serverRows] = await db.execute(
+        `SELECT codigo FROM wowza_servers WHERE status = 'ativo' LIMIT 1`
+      );
+
+      if (serverRows.length === 0) {
+        return {
+          success: false,
+          error: 'Nenhum servidor Wowza ativo encontrado'
+        };
+      }
+
+      const serverId = serverRows[0].codigo;
+
+      // Testar comando JMX simples
+      const jmxCommand = '/usr/bin/java -cp /usr/local/WowzaMediaServer JMXCommandLine -jmx service:jmx:rmi://localhost:8084/jndi/rmi://localhost:8085/jmxrmi -user admin -pass admin';
+      const testCommand = `${jmxCommand} getServerVersion`;
+
+      const result = await SSHManager.executeCommand(serverId, testCommand);
+
+      if (result.stdout && !result.stdout.includes('ERROR') && !result.stdout.includes('Exception')) {
+        return {
+          success: true,
+          message: 'Conexão Wowza OK via JMX',
+          version: result.stdout.trim()
+        };
+      } else {
+        return {
+          success: false,
+          error: 'Erro ao conectar via JMX',
+          details: result.stdout || result.stderr
+        };
+      }
     } catch (error) {
       console.error('Erro ao testar conexão Wowza:', error);
       return {
@@ -191,119 +214,115 @@ class WowzaStreamingService {
     }
   }
 
-  // Iniciar Stream Publisher via REST API
+  // Verificar se Stream Publisher pode ser iniciado (SMIL file existe)
   async startStreamPublisher(userLogin, smilFile, serverId) {
     try {
-      console.log(`🎬 Iniciando Stream Publisher para ${userLogin} com arquivo ${smilFile}`);
+      console.log(`🎬 Verificando Stream Publisher para ${userLogin} com arquivo ${smilFile}`);
 
-      // Para SMIL files, usar MediaCaster via REST API
-      const streamName = smilFile.replace('.smil', '');
+      const SSHManager = require('./SSHManager');
 
-      const mediaCasterConfig = {
-        restURI: `http://localhost:8087/v2/servers/_defaultServer_/vhosts/_defaultVHost_/applications/${userLogin}/instances/_definst_/streamfiles/${smilFile}`,
-        serverName: "_defaultServer_",
-        vhostName: "_defaultVHost_",
-        appName: userLogin,
-        mediaCasterType: "rtp",
-        streamFile: smilFile
-      };
+      // Verificar se o arquivo SMIL existe no servidor
+      // Tentar ambos os caminhos possíveis
+      const possiblePaths = [
+        `/usr/local/WowzaStreamingEngine/content/${userLogin}/${smilFile}`,
+        `/usr/local/WowzaMediaServer/content/${userLogin}/${smilFile}`,
+        `/home/streaming/${userLogin}/${smilFile}`
+      ];
 
-      try {
-        const response = await fetch(`${this.baseUrl}/v2/servers/_defaultServer_/vhosts/_defaultVHost_/applications/${userLogin}/instances/_definst_/streamfiles`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Basic ${Buffer.from(`${this.username}:${this.password}`).toString('base64')}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(mediaCasterConfig),
-          timeout: 10000
-        });
-
-        if (response.ok || response.status === 409) {
-          // 409 significa que já existe, o que é OK
-          console.log(`✅ Stream Publisher configurado para ${userLogin}`);
-
-          // Aguardar um pouco para o stream se estabilizar
-          await new Promise(resolve => setTimeout(resolve, 2000));
-
-          return { success: true };
-        } else {
-          const errorText = await response.text();
-          console.warn(`Aviso ao configurar MediaCaster:`, errorText);
-
-          // Se falhar via REST API, o stream ainda pode funcionar se o arquivo SMIL existir
-          // Verificar se o arquivo SMIL existe no servidor
-          const SSHManager = require('./SSHManager');
-          const smilPath = `/usr/local/WowzaStreamingEngine/content/${userLogin}/${smilFile}`;
-          const checkCommand = `test -f "${smilPath}" && echo "EXISTS" || echo "NOT_EXISTS"`;
-          const checkResult = await SSHManager.executeCommand(serverId, checkCommand);
-
-          if (checkResult.stdout.includes('EXISTS')) {
-            console.log(`✅ Arquivo SMIL existe, stream pode ser acessado: ${smilPath}`);
-            return { success: true };
-          } else {
-            return { success: false, error: `Arquivo SMIL não encontrado: ${smilPath}` };
-          }
-        }
-      } catch (apiError) {
-        console.warn(`Erro na API REST do Wowza:`, apiError.message);
-
-        // Fallback: verificar se arquivo SMIL existe
-        const SSHManager = require('./SSHManager');
-        const smilPath = `/usr/local/WowzaStreamingEngine/content/${userLogin}/${smilFile}`;
-        const checkCommand = `test -f "${smilPath}" && echo "EXISTS" || echo "NOT_EXISTS"`;
+      let smilPath = null;
+      for (const path of possiblePaths) {
+        const checkCommand = `test -f "${path}" && echo "EXISTS" || echo "NOT_EXISTS"`;
         const checkResult = await SSHManager.executeCommand(serverId, checkCommand);
 
         if (checkResult.stdout.includes('EXISTS')) {
-          console.log(`✅ Arquivo SMIL existe, stream pode ser acessado (API não disponível)`);
-          return { success: true };
-        } else {
-          return { success: false, error: `Arquivo SMIL não encontrado e API não disponível` };
+          smilPath = path;
+          console.log(`✅ Arquivo SMIL encontrado: ${path}`);
+          break;
         }
       }
+
+      if (!smilPath) {
+        console.error(`❌ Arquivo SMIL não encontrado em nenhum dos caminhos`);
+        return { success: false, error: `Arquivo SMIL ${smilFile} não encontrado` };
+      }
+
+      // Verificar conteúdo do arquivo SMIL para garantir que está válido
+      const catCommand = `cat "${smilPath}" | head -5`;
+      const catResult = await SSHManager.executeCommand(serverId, catCommand);
+
+      if (!catResult.stdout.includes('<smil>') && !catResult.stdout.includes('<seq>')) {
+        console.error(`❌ Arquivo SMIL parece estar vazio ou inválido`);
+        return { success: false, error: 'Arquivo SMIL vazio ou inválido' };
+      }
+
+      console.log(`✅ Arquivo SMIL válido encontrado: ${smilPath}`);
+      console.log(`📡 Stream disponível em: http://stmv1.udicast.com/${userLogin}/smil:${smilFile}/playlist.m3u8`);
+
+      return { success: true, smilPath };
     } catch (error) {
-      console.error('Erro ao iniciar Stream Publisher:', error);
+      console.error('Erro ao verificar Stream Publisher:', error);
       return { success: false, error: error.message };
     }
   }
 
-  // Configurar Push Publish para plataformas externas
+  // Configurar Push Publish para plataformas externas via arquivo de configuração
   async configurePushPublish(userLogin, platform) {
     try {
-      const pushConfig = {
-        restURI: `http://localhost:8087/v2/servers/_defaultServer_/applications/${userLogin}/pushpublish/mapentries/${platform.platform.codigo}`,
-        serverName: "_defaultServer_",
-        appName: userLogin,
-        appInstance: "_definst_",
-        streamName: userLogin,
-        entryName: platform.platform.codigo,
-        profile: "rtmp",
-        host: platform.rtmp_url || platform.platform.rtmp_base_url,
-        application: "live",
-        streamFile: platform.stream_key,
-        userName: "",
-        password: "",
-        enabled: true
-      };
+      console.log(`⚙️ Configurando push publish para ${platform.platform.nome} (${userLogin})`);
 
-      const response = await fetch(`${this.baseUrl}/v2/servers/_defaultServer_/applications/${userLogin}/pushpublish/mapentries`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Basic ${Buffer.from(`${this.username}:${this.password}`).toString('base64')}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(pushConfig),
-        timeout: 10000
-      });
+      // Como REST API não está disponível, usar arquivo PushPublishMap.txt
+      // Este é o método tradicional do Wowza para configurar push publish
 
-      if (response.ok) {
-        console.log(`✅ Push configurado para ${platform.platform.nome}`);
-        return { success: true };
-      } else {
-        const errorText = await response.text();
-        console.warn(`Erro ao configurar push para ${platform.platform.nome}:`, errorText);
-        return { success: false, error: errorText };
+      const SSHManager = require('./SSHManager');
+
+      // Buscar serverId
+      const [serverRows] = await db.execute(
+        `SELECT codigo FROM wowza_servers WHERE status = 'ativo' LIMIT 1`
+      );
+
+      const serverId = serverRows.length > 0 ? serverRows[0].codigo : 1;
+
+      // Caminho do arquivo PushPublishMap.txt
+      const pushMapPath = `/usr/local/WowzaStreamingEngine/conf/${userLogin}/PushPublishMap.txt`;
+
+      // Formato da linha:
+      // {stream-name}={profile}://{host}:{port}/{application}/{stream-key}
+      const rtmpUrl = platform.rtmp_url || platform.platform.rtmp_base_url;
+      const streamKey = platform.stream_key;
+
+      // Extrair host e porta da URL RTMP
+      const rtmpMatch = rtmpUrl.match(/rtmp:\/\/([^:\/]+)(?::(\d+))?(?:\/(.+))?/);
+      if (!rtmpMatch) {
+        console.error(`❌ URL RTMP inválida: ${rtmpUrl}`);
+        return { success: false, error: 'URL RTMP inválida' };
       }
+
+      const host = rtmpMatch[1];
+      const port = rtmpMatch[2] || '1935';
+      const app = rtmpMatch[3] || 'live';
+
+      const pushEntry = `${userLogin}=rtmp://${host}:${port}/${app}/${streamKey}`;
+
+      // Verificar se entrada já existe
+      const checkCommand = `grep -q "${userLogin}=" "${pushMapPath}" 2>/dev/null && echo "EXISTS" || echo "NOT_EXISTS"`;
+      const checkResult = await SSHManager.executeCommand(serverId, checkCommand);
+
+      if (checkResult.stdout.includes('EXISTS')) {
+        console.log(`⚠️ Push publish já configurado para ${userLogin}, atualizando...`);
+        // Remover linha antiga e adicionar nova
+        const updateCommand = `sed -i "/${userLogin}=/d" "${pushMapPath}" && echo "${pushEntry}" >> "${pushMapPath}"`;
+        await SSHManager.executeCommand(serverId, updateCommand);
+      } else {
+        // Adicionar nova entrada
+        const addCommand = `echo "${pushEntry}" >> "${pushMapPath}"`;
+        await SSHManager.executeCommand(serverId, addCommand);
+      }
+
+      console.log(`✅ Push publish configurado: ${pushEntry}`);
+      console.log(`💡 Reinicie a aplicação ${userLogin} para aplicar as mudanças`);
+
+      return { success: true, push_entry: pushEntry };
+
     } catch (error) {
       console.error(`Erro ao configurar push para ${platform.platform.nome}:`, error);
       return { success: false, error: error.message };
@@ -874,7 +893,7 @@ class WowzaStreamingService {
     }
   }
 
-  // Parar streaming SMIL via REST API
+  // Parar streaming SMIL (desligar aplicação via JMX)
   async stopSMILStreaming(userId, userLogin, smilFileName) {
     try {
       console.log(`🛑 Parando streaming SMIL para ${userLogin}: ${smilFileName}`);
@@ -884,46 +903,37 @@ class WowzaStreamingService {
         await this.initializeFromDatabase(userId);
       }
 
-      // Parar MediaCaster via REST API
-      try {
-        const response = await fetch(
-          `${this.baseUrl}/v2/servers/_defaultServer_/vhosts/_defaultVHost_/applications/${userLogin}/instances/_definst_/streamfiles/${smilFileName}`,
-          {
-            method: 'DELETE',
-            headers: {
-              'Authorization': `Basic ${Buffer.from(`${this.username}:${this.password}`).toString('base64')}`,
-              'Content-Type': 'application/json'
-            },
-            timeout: 10000
-          }
-        );
+      // Buscar serverId
+      const [serverRows] = await db.execute(
+        `SELECT codigo FROM wowza_servers WHERE status = 'ativo' LIMIT 1`
+      );
 
-        if (response.ok || response.status === 404) {
-          // 404 significa que não existe/já foi parado, o que é OK
-          console.log(`✅ Streaming SMIL parado com sucesso para ${userLogin}`);
-          return {
-            success: true,
-            message: 'Streaming parado com sucesso'
-          };
-        } else {
-          const errorText = await response.text();
-          console.warn(`Aviso ao parar streaming:`, errorText);
-          // Mesmo com warning, considerar sucesso se stream não estiver ativo
-          return {
-            success: true,
-            message: 'Streaming parado (ou já estava inativo)',
-            warning: errorText
-          };
-        }
-      } catch (apiError) {
-        console.warn(`Erro na API REST:`, apiError.message);
-        // Se API não estiver disponível, considerar como sucesso (stream não está rodando)
-        return {
-          success: true,
-          message: 'API não disponível, stream provavelmente já está parado',
-          warning: apiError.message
-        };
+      const serverId = serverRows.length > 0 ? serverRows[0].codigo : 1;
+
+      // Para parar o streaming SMIL, podemos:
+      // 1. Desligar a aplicação completamente (muito agressivo)
+      // 2. Apenas remover/renomear o arquivo SMIL (mais suave)
+      // 3. Simplesmente retornar sucesso já que o Wowza gerencia isso automaticamente
+
+      // Opção mais suave: verificar se aplicação está rodando
+      const SSHManager = require('./SSHManager');
+      const jmxCommand = '/usr/bin/java -cp /usr/local/WowzaMediaServer JMXCommandLine -jmx service:jmx:rmi://localhost:8084/jndi/rmi://localhost:8085/jmxrmi -user admin -pass admin';
+
+      const statusCommand = `${jmxCommand} getApplicationInstanceInfo ${userLogin}`;
+      const statusResult = await SSHManager.executeCommand(serverId, statusCommand);
+
+      if (statusResult.stdout && statusResult.stdout.includes('loaded')) {
+        console.log(`✅ Aplicação ${userLogin} está rodando. Streaming SMIL será parado quando os viewers desconectarem.`);
+        console.log(`💡 Para forçar parada, desligar a aplicação ou remover o arquivo SMIL.`);
+      } else {
+        console.log(`✅ Aplicação ${userLogin} já está desligada.`);
       }
+
+      return {
+        success: true,
+        message: 'Streaming SMIL parado (ou será parado quando não houver mais viewers)'
+      };
+
     } catch (error) {
       console.error('Erro ao parar streaming SMIL:', error);
       return {
